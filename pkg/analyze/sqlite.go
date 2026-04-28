@@ -312,13 +312,46 @@ func (s *SqliteStorage) deleteItemTree(tx *sql.Tx, id int64) error {
 	return err
 }
 
-// updateAncestorStats subtracts size/usage/itemCount from a single ancestor row within the given transaction.
-func (s *SqliteStorage) updateAncestorStats(tx *sql.Tx, id, size, usage, itemCount int64) error {
-	_, err := tx.Exec(
-		`UPDATE items SET size = size - ?, usage = usage - ?, item_count = item_count - ? WHERE id = ?`,
-		size, usage, itemCount, id,
+// RemoveItemAndUpdateStats removes an item and updates all its ancestors' stats in the database
+func (s *SqliteStorage) RemoveItemAndUpdateStats(id, size, usage, itemCount int64) error {
+	s.m.Lock()
+	defer s.m.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	// 1. Update all ancestors using recursive CTE
+	updateAncestorsQuery := `
+	WITH RECURSIVE ancestors(id, parent_id) AS (
+		SELECT parent_id, NULL FROM items WHERE id = ?
+		UNION ALL
+		SELECT i.parent_id, NULL FROM items i JOIN ancestors a ON i.id = a.id WHERE i.parent_id IS NOT NULL
 	)
-	return err
+	UPDATE items
+	SET size = size - ?, usage = usage - ?, item_count = item_count - ?
+	WHERE id IN (SELECT id FROM ancestors)
+	`
+	_, err = tx.Exec(updateAncestorsQuery, id, size, usage, itemCount)
+	if err != nil {
+		rollbackErr := tx.Rollback()
+		if rollbackErr != nil {
+			log.Errorf("failed to rollback transaction: %v", rollbackErr)
+		}
+		return err
+	}
+
+	// 2. Delete the item and its descendants
+	if err = s.deleteItemTree(tx, id); err != nil {
+		rollbackErr := tx.Rollback()
+		if rollbackErr != nil {
+			log.Errorf("failed to rollback transaction: %v", rollbackErr)
+		}
+		return err
+	}
+
+	return tx.Commit()
 }
 
 // GetChildByName returns a child item by its name and parent ID
@@ -515,6 +548,8 @@ func (i *SqliteItem) IsDir() bool {
 
 // GetSize returns the apparent size
 func (i *SqliteItem) GetSize() int64 {
+	i.m.RLock()
+	defer i.m.RUnlock()
 	return i.size
 }
 
@@ -531,35 +566,50 @@ func (i *SqliteItem) GetType() string {
 
 // GetUsage returns the disk usage
 func (i *SqliteItem) GetUsage() int64 {
+	i.m.RLock()
+	defer i.m.RUnlock()
 	return i.usage
 }
 
 // GetMtime returns the modification time
 func (i *SqliteItem) GetMtime() time.Time {
+	i.m.RLock()
+	defer i.m.RUnlock()
 	return i.mtime
 }
 
 // GetItemCount returns the item count
 func (i *SqliteItem) GetItemCount() int64 {
+	i.m.RLock()
+	defer i.m.RUnlock()
 	return i.itemCount
 }
 
 // GetParent returns the parent item
 func (i *SqliteItem) GetParent() fs.Item {
+	i.m.RLock()
 	if i.parent != nil {
+		defer i.m.RUnlock()
 		return i.parent
 	}
 	if i.parentID == nil {
+		defer i.m.RUnlock()
 		return nil
 	}
+	i.m.RUnlock()
 
 	parent, err := i.storage.GetItemByID(*i.parentID)
 	if err != nil {
 		log.Print(err.Error())
 		return nil
 	}
-	i.parent = parent
-	return parent
+
+	i.m.Lock()
+	defer i.m.Unlock()
+	if i.parent == nil {
+		i.parent = parent
+	}
+	return i.parent
 }
 
 // SetParent sets the parent item
@@ -743,56 +793,9 @@ func (i *SqliteItem) RemoveFile(item fs.Item) {
 	usage := item.GetUsage()
 	itemCount := item.GetItemCount()
 
-	i.storage.m.Lock()
-	tx, err := i.storage.db.Begin()
-	if err != nil {
-		i.storage.m.Unlock()
-		log.Errorf("Error starting transaction for deletion: %v", err)
-		return
-	}
-
-	if err = i.storage.deleteItemTree(tx, sqliteItem.id); err != nil {
-		if rbErr := tx.Rollback(); rbErr != nil {
-			log.Errorf("failed to rollback transaction: %v", rbErr)
-		}
-		i.storage.m.Unlock()
-		log.Errorf("Error deleting item from database: %v", err)
-		return
-	}
-
-	// Collect ancestor IDs for DB updates, walking the in-memory parent chain.
-	var ancestorIDs []int64
+	// Apply in-memory stats updates for loaded ancestors first,
+	// to avoid double-counting if ancestors are loaded from DB after it's updated.
 	cur := i
-	for {
-		ancestorIDs = append(ancestorIDs, cur.id)
-		parent := cur.GetParentLocked()
-		if parent == nil {
-			break
-		}
-		cur = parent
-	}
-
-	// Update all ancestor rows in the DB within the transaction.
-	for _, aid := range ancestorIDs {
-		if err = i.storage.updateAncestorStats(tx, aid, size, usage, itemCount); err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
-				log.Errorf("failed to rollback transaction: %v", rbErr)
-			}
-			i.storage.m.Unlock()
-			log.Errorf("Error updating ancestor stats in database: %v", err)
-			return
-		}
-	}
-
-	if err = tx.Commit(); err != nil {
-		log.Errorf("Error committing deletion transaction: %v", err)
-		i.storage.m.Unlock()
-		return
-	}
-	i.storage.m.Unlock()
-
-	// DB commit succeeded — now apply in-memory stats updates.
-	cur = i
 	for {
 		cur.m.Lock()
 		cur.size -= size
@@ -805,6 +808,11 @@ func (i *SqliteItem) RemoveFile(item fs.Item) {
 			break
 		}
 		cur = parent
+	}
+
+	if err := i.storage.RemoveItemAndUpdateStats(sqliteItem.id, size, usage, itemCount); err != nil {
+		log.Errorf("Error removing item and updating stats: %v", err)
+		return
 	}
 }
 
@@ -903,6 +911,101 @@ func (a *SqliteAnalyzer) AnalyzeDir(
 	return rootItem
 }
 
+// fileStat holds stats for a single file entry computed by processFile.
+type fileStat struct {
+	size      int64
+	usage     int64
+	itemCount int64
+	mli       uint64
+	flag      rune
+	// archiveDir is non-nil when the file is an archive that was expanded.
+	archiveDir *Dir
+}
+
+// processArchiveEntry tries to expand name/entryPath as a zip or tar archive.
+// Returns the archive *Dir on success, or nil on failure (in which case err is set).
+func (a *SqliteAnalyzer) processArchiveEntry(entryPath, name string, info os.FileInfo) (*Dir, error) {
+	if isZipFile(name) {
+		archiveDirZip, errZip := processZipFile(entryPath, info)
+		if errZip != nil {
+			return nil, errZip
+		}
+		uncompressedSize, compressedSize, errSize := getZipFileSize(entryPath)
+		if errSize == nil {
+			archiveDirZip.Size = uncompressedSize
+			archiveDirZip.Usage = compressedSize
+		}
+		return archiveDirZip.Dir, nil
+	}
+	archiveDirTar, errTar := processTarFile(entryPath, info)
+	if errTar != nil {
+		return nil, errTar
+	}
+	return archiveDirTar.Dir, nil
+}
+
+// processFile resolves a single non-directory entry and returns its stats.
+// It returns nil when the file should be skipped entirely.
+func (a *SqliteAnalyzer) processFile(entryPath, name string, f os.DirEntry) (stat fileStat) {
+	if a.ignoreFileType != nil && a.ignoreFileType(name) {
+		return stat
+	}
+
+	info, err := f.Info()
+	if err != nil {
+		log.Print(err.Error())
+		return stat
+	}
+
+	if a.followSymlinks && info.Mode()&os.ModeSymlink != 0 {
+		infoF, err := followSymlink(entryPath, a.gitAnnexedSize)
+		if err != nil {
+			log.Print(err.Error())
+			return stat
+		}
+		if infoF != nil {
+			info = infoF
+		}
+	}
+
+	if a.matchesTimeFilterFn != nil && !a.matchesTimeFilterFn(info.ModTime()) {
+		return stat
+	}
+
+	if a.archiveBrowsing && (isZipFile(name) || isTarFile(name)) {
+		archiveDir, err := a.processArchiveEntry(entryPath, name, info)
+		if err != nil {
+			log.Printf("Failed to process archive %s: %v", entryPath, err)
+		} else {
+			return fileStat{
+				size:       archiveDir.Size,
+				usage:      archiveDir.Usage,
+				itemCount:  archiveDir.ItemCount,
+				flag:       archiveDir.Flag,
+				archiveDir: archiveDir,
+			}
+		}
+	}
+
+	fileSize := info.Size()
+	fileUsage, fileMli := getSyscallStats(info)
+	fileFlag := getFlag(info)
+
+	if fileMli != 0 && a.storage.HasInode(fileMli) {
+		fileSize = 0
+		fileUsage = 0
+		fileFlag = 'H'
+	}
+
+	return fileStat{
+		size:  fileSize,
+		usage: fileUsage,
+		mli:   fileMli,
+		flag:  fileFlag,
+	}
+}
+
+// nolint:funlen
 func (a *SqliteAnalyzer) processDir(path string, parentID *int64) *SqliteItem {
 	// Start with 4096 for directory's own size/usage, matching Dir.UpdateStats behavior
 	var (
@@ -961,66 +1064,65 @@ func (a *SqliteAnalyzer) processDir(path string, parentID *int64) *SqliteItem {
 				totalUsage += subItem.usage
 				itemCount += subItem.itemCount
 			}
-		} else {
-			// Apply file type filter
-			if a.ignoreFileType != nil && a.ignoreFileType(name) {
-				continue
-			}
+			continue
+		}
 
-			info, err := f.Info()
-			if err != nil {
-				log.Print(err.Error())
-				continue
-			}
+		info, err := f.Info()
+		if err != nil {
+			log.Print(err.Error())
+			continue
+		}
 
-			if a.followSymlinks && info.Mode()&os.ModeSymlink != 0 {
-				infoF, err := followSymlink(entryPath, a.gitAnnexedSize)
-				if err != nil {
-					log.Print(err.Error())
-					continue
-				}
-				if infoF != nil {
-					info = infoF
-				}
-			}
+		stat := a.processFile(entryPath, name, f)
+		if stat == (fileStat{}) {
+			continue
+		}
 
-			// Apply time filter
-			if a.matchesTimeFilterFn != nil && !a.matchesTimeFilterFn(info.ModTime()) {
-				continue
-			}
-
-			fileSize := info.Size()
-			fileUsage, fileMli := getSyscallStats(info)
-			fileFlag := getFlag(info)
-
-			// Handle hard links: if inode already seen, don't count size
-			if fileMli != 0 && a.storage.HasInode(fileMli) {
-				fileSize = 0
-				fileUsage = 0
-				fileFlag = 'H'
-			}
-
-			_, err = a.storage.InsertItem(
+		if stat.archiveDir != nil {
+			archiveID, err := a.storage.InsertItem(
 				&dirID,
 				name,
-				false,
-				fileSize,
-				fileUsage,
+				true,
+				stat.archiveDir.Size,
+				stat.archiveDir.Usage,
 				info.ModTime(),
-				1,
-				fileMli,
-				fileFlag,
+				stat.archiveDir.ItemCount,
+				0,
+				stat.archiveDir.Flag,
 			)
 			if err != nil {
 				log.Print(err.Error())
 				continue
 			}
+			a.persistArchive(stat.archiveDir, archiveID)
 
-			totalSize += fileSize
-			totalUsage += fileUsage
-			filesSize += fileUsage
-			itemCount++
+			totalSize += stat.size
+			totalUsage += stat.usage
+			filesSize += stat.usage
+			itemCount += stat.itemCount
+			continue
 		}
+
+		_, err = a.storage.InsertItem(
+			&dirID,
+			name,
+			false,
+			stat.size,
+			stat.usage,
+			info.ModTime(),
+			1,
+			stat.mli,
+			stat.flag,
+		)
+		if err != nil {
+			log.Print(err.Error())
+			continue
+		}
+
+		totalSize += stat.size
+		totalUsage += stat.usage
+		filesSize += stat.usage
+		itemCount++
 	}
 
 	// Update directory with computed stats
@@ -1048,5 +1150,59 @@ func (a *SqliteAnalyzer) processDir(path string, parentID *int64) *SqliteItem {
 		mtime:     dirMtime,
 		itemCount: itemCount,
 		flag:      getDirFlag(err, len(files)),
+	}
+}
+
+func (a *SqliteAnalyzer) persistArchive(archiveDir *Dir, parentID int64) {
+	if archiveDir == nil {
+		return
+	}
+	for _, f := range archiveDir.Files {
+		if f.IsDir() {
+			var subDir *Dir
+			switch v := f.(type) {
+			case *ZipDir:
+				subDir = v.Dir
+			case *TarDir:
+				subDir = v.Dir
+			}
+
+			if subDir == nil {
+				continue
+			}
+
+			id, err := a.storage.InsertItem(
+				&parentID,
+				f.GetName(),
+				true,
+				f.GetSize(),
+				f.GetUsage(),
+				f.GetMtime(),
+				f.GetItemCount(),
+				0,
+				f.GetFlag(),
+			)
+			if err != nil {
+				log.Print(err.Error())
+				continue
+			}
+			a.persistArchive(subDir, id)
+		} else {
+			_, err := a.storage.InsertItem(
+				&parentID,
+				f.GetName(),
+				false,
+				f.GetSize(),
+				f.GetUsage(),
+				f.GetMtime(),
+				1,
+				f.GetMultiLinkedInode(),
+				f.GetFlag(),
+			)
+			if err != nil {
+				log.Print(err.Error())
+				continue
+			}
+		}
 	}
 }
